@@ -101,7 +101,7 @@ Both behave identically. Pick whichever you prefer.
 ./aurcheck --refresh  # re-fetch the IOC lists from upstream first
 ./aurcheck --helper yay
 ./aurcheck --yes      # non-interactive: update RECOMMENDED, no prompt
-./aurcheck --no-color
+./aurcheck --no-color # for those beyond hope
 ```
 
 Pick the update action at the prompt:
