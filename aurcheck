@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# aurcheck — vet AUR updates against the 2026 "Atomic Arch" supply-chain attack.
+#
+# Lists every updatable AUR package, shows how long since the maintainer last
+# changed, flags known breach indicators (compromised packages, attacker
+# accounts, the June 9-12 2026 attack window, and maintainer swaps detected
+# since the last run), then lets you update only the cleared packages.
+#
+# Pure shell (bash). Companion to aurcheck.py. Needs: curl, jq, pacman,
+# paru|yay, coreutils.
+set -uo pipefail
+
+# --- constants ---------------------------------------------------------------
+RPC_BASE="https://aur.archlinux.org/rpc/v5/info"
+RPC_CHUNK=150
+IOC_BASE="https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/data/campaigns/aur-infected"
+ATTACK_START=1749427200   # 2026-06-09 00:00:00 UTC
+ATTACK_END=1749772799     # 2026-06-12 23:59:59 UTC
+POP_THRESHOLD=1.0
+VOTES_THRESHOLD=10
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BUNDLED_DATA="$HERE/data"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aurcheck"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aurcheck"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/aurcheck"
+WHITELIST="$CONFIG_DIR/whitelist.txt"
+SNAPSHOT="$STATE_DIR/snapshot.json"
+
+REFRESH=0; HELPER=""; NOCOLOR=0; YES=0
+
+# --- args --------------------------------------------------------------------
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --refresh) REFRESH=1 ;;
+    --helper) shift; HELPER="${1:-}" ;;
+    --no-color) NOCOLOR=1 ;;
+    --yes) YES=1 ;;
+    -h|--help) usage ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# --- colors ------------------------------------------------------------------
+if [ "$NOCOLOR" = 1 ] || [ ! -t 1 ]; then
+  RED=""; GREEN=""; YELLOW=""; DIM=""; BOLD=""; RST=""
+else
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  DIM=$'\033[2m'; BOLD=$'\033[1m'; RST=$'\033[0m'
+fi
+
+need() { command -v "$1" >/dev/null 2>&1; }
+for dep in curl jq pacman; do
+  need "$dep" || { echo "error: missing dependency: $dep" >&2; exit 1; }
+done
+
+# --- helper detection --------------------------------------------------------
+detect_helper() {
+  for h in $HELPER paru yay; do
+    [ -n "$h" ] && need "$h" && { echo "$h"; return; }
+  done
+}
+HELPER="$(detect_helper)"
+[ -n "$HELPER" ] || { echo "error: neither paru nor yay found" >&2; exit 1; }
+
+# --- IOC + whitelist ---------------------------------------------------------
+fetch_iocs() {
+  mkdir -p "$CACHE_DIR"
+  for f in packages.txt accounts.json npm-packages.txt; do
+    curl -fsSL "$IOC_BASE/$f" -o "$CACHE_DIR/$f" \
+      || echo "${YELLOW}warning: could not refresh $f${RST}" >&2
+  done
+}
+ioc_path() {  # prefer cache, fall back to bundled
+  if [ -f "$CACHE_DIR/$1" ]; then echo "$CACHE_DIR/$1"; else echo "$BUNDLED_DATA/$1"; fi
+}
+
+echo "${DIM}Loading IOC lists…${RST}"
+if [ "$REFRESH" = 1 ] || [ ! -f "$CACHE_DIR/packages.txt" ]; then fetch_iocs; fi
+
+COMPROMISED_FILE="$(ioc_path packages.txt)"
+ACCOUNTS_FILE="$(ioc_path accounts.json)"
+
+# attacker accounts = everything except status "commitforgery" (impersonated)
+ATTACKERS=" $(jq -r '.accounts | to_entries[] | select(.value.status!="commitforgery") | .key' "$ACCOUNTS_FILE" 2>/dev/null | tr '\n' ' ') "
+FORGED=" $(jq -r '.accounts | to_entries[] | select(.value.status=="commitforgery") | .key' "$ACCOUNTS_FILE" 2>/dev/null | tr '\n' ' ') "
+
+WHITELIST_SET=""
+[ -f "$WHITELIST" ] && WHITELIST_SET=" $(grep -vE '^\s*(#|$)' "$WHITELIST" | tr '\n' ' ') "
+
+in_set() { case "$2" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+in_file() { grep -qxF "$1" "$2" 2>/dev/null; }
+
+# --- snapshot (jq-backed) ----------------------------------------------------
+mkdir -p "$STATE_DIR"
+[ -f "$SNAPSHOT" ] || echo '{}' > "$SNAPSHOT"
+snap_maint() { jq -r --arg n "$1" '.[$n].maintainer // "__none__"' "$SNAPSHOT" 2>/dev/null; }
+
+# --- enumerate updatable AUR packages ---------------------------------------
+echo "${DIM}Enumerating AUR updates via $HELPER…${RST}"
+declare -A OLD NEW
+NAMES=()
+while read -r name oldv arrow newv _; do
+  [ -z "$name" ] && continue
+  case "$name" in ::*|:*) continue ;; esac
+  if [ "$arrow" = "->" ]; then
+    OLD[$name]="$oldv"; NEW[$name]="$newv"; NAMES+=("$name")
+  elif [ -n "$newv" ]; then  # tolerate "name old new"
+    OLD[$name]="$oldv"; NEW[$name]="$arrow"; NAMES+=("$name")
+  fi
+done < <("$HELPER" -Qua 2>/dev/null)
+
+if [ "${#NAMES[@]}" -eq 0 ]; then
+  echo "${GREEN}No AUR updates available. Nothing to do.${RST}"; exit 0
+fi
+
+# --- query AUR RPC in chunks -------------------------------------------------
+echo "${DIM}Querying AUR metadata for ${#NAMES[@]} package(s)…${RST}"
+RPC_JSON="$(mktemp)"; trap 'rm -f "$RPC_JSON"' EXIT
+echo '[]' > "$RPC_JSON"
+i=0
+while [ "$i" -lt "${#NAMES[@]}" ]; do
+  args=(); j=0
+  while [ "$j" -lt "$RPC_CHUNK" ] && [ "$i" -lt "${#NAMES[@]}" ]; do
+    args+=(--data-urlencode "arg[]=${NAMES[$i]}"); i=$((i+1)); j=$((j+1))
+  done
+  resp="$(curl -fsSG "${args[@]}" "$RPC_BASE" 2>/dev/null)" || {
+    echo "${YELLOW}warning: AUR RPC query failed${RST}" >&2; continue; }
+  # merge results array
+  printf '%s\n' "$resp" | jq -c '.results // []' > "${RPC_JSON}.new" 2>/dev/null \
+    && jq -s '.[0] + .[1]' "$RPC_JSON" "${RPC_JSON}.new" > "${RPC_JSON}.merged" \
+    && mv "${RPC_JSON}.merged" "$RPC_JSON"
+done
+rm -f "${RPC_JSON}.new"
+
+# index metadata by name into temp files for quick lookup
+META_DIR="$(mktemp -d)"; trap 'rm -f "$RPC_JSON"; rm -rf "$META_DIR"' EXIT
+jq -r '.[] | @base64' "$RPC_JSON" 2>/dev/null | while read -r row; do
+  d="$(echo "$row" | base64 -d)"
+  n="$(echo "$d" | jq -r '.Name')"
+  echo "$d" > "$META_DIR/$n"
+done
+
+EXPLICIT=" $(pacman -Qqe | tr '\n' ' ') "
+
+# --- helpers -----------------------------------------------------------------
+rel_time() {  # epoch -> "Nd ago"
+  local e="$1" now d
+  [ -z "$e" ] || [ "$e" = "null" ] && { echo "?"; return; }
+  now=$(date +%s); d=$((now - e))
+  [ "$d" -lt 0 ] && { echo "future"; return; }
+  if   [ "$d" -ge 31536000 ]; then echo "$((d/31536000))y ago"
+  elif [ "$d" -ge 2592000 ];  then echo "$((d/2592000))mo ago"
+  elif [ "$d" -ge 86400 ];    then echo "$((d/86400))d ago"
+  elif [ "$d" -ge 3600 ];     then echo "$((d/3600))h ago"
+  elif [ "$d" -ge 60 ];       then echo "$((d/60))m ago"
+  else echo "just now"; fi
+}
+ge_float() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0>=b+0)}'; }
+
+# --- classify ----------------------------------------------------------------
+# results accumulate in parallel arrays
+declare -A VERDICT REASON CHANGED MAINT LMOD POP VOT
+NEW_SNAP="$(mktemp)"; cp "$SNAPSHOT" "$NEW_SNAP"
+trap 'rm -f "$RPC_JSON" "$NEW_SNAP"; rm -rf "$META_DIR"' EXIT
+
+for name in "${NAMES[@]}"; do
+  reasons=""; verdict=""; changed=""; blocked=0
+  metaf="$META_DIR/$name"
+  if [ ! -f "$metaf" ]; then
+    VERDICT[$name]="UNKNOWN"; REASON[$name]="not found on AUR"
+    MAINT[$name]="—"; LMOD[$name]=""; POP[$name]=0; VOT[$name]=0; CHANGED[$name]=""
+    continue
+  fi
+  maint="$(jq -r '.Maintainer // ""' "$metaf")"
+  lmod="$(jq -r '.LastModified // ""' "$metaf")"
+  pop="$(jq -r '.Popularity // 0' "$metaf")"
+  vot="$(jq -r '.NumVotes // 0' "$metaf")"
+  MAINT[$name]="${maint:-—}"; LMOD[$name]="$lmod"; POP[$name]="$pop"; VOT[$name]="$vot"
+
+  # update snapshot
+  NEW_SNAP_TMP="$(mktemp)"
+  jq --arg n "$name" --arg m "$maint" --arg l "$lmod" --argjson t "$(date +%s)" \
+     '.[$n]={maintainer:$m,lastmodified:$l,last_seen:$t}' "$NEW_SNAP" > "$NEW_SNAP_TMP" \
+     && mv "$NEW_SNAP_TMP" "$NEW_SNAP"
+
+  if in_set "$name" "$WHITELIST_SET"; then
+    VERDICT[$name]="RECOMMENDED"; REASON[$name]="whitelisted by you"; CHANGED[$name]=""
+    continue
+  fi
+
+  prev="$(snap_maint "$name")"
+  if [ "$prev" != "__none__" ] && [ "$prev" != "$maint" ]; then
+    changed="YES"; blocked=1
+    reasons="maintainer changed: ${prev:-orphan} -> ${maint:-orphan}"
+  fi
+  if [ -n "$maint" ] && in_set "$maint" "$ATTACKERS"; then
+    blocked=1; reasons="${reasons:+$reasons; }maintainer '$maint' is a flagged attacker account"
+  fi
+  if in_file "$name" "$COMPROMISED_FILE"; then
+    blocked=1; reasons="${reasons:+$reasons; }on known compromised-package list"
+  fi
+  if [ -n "$lmod" ] && [ "$lmod" != "null" ] && [ "$lmod" -ge "$ATTACK_START" ] && [ "$lmod" -le "$ATTACK_END" ]; then
+    blocked=1; reasons="${reasons:+$reasons; }modified during June 9-12 attack window"
+  fi
+  CHANGED[$name]="$changed"
+
+  if [ "$blocked" = 1 ]; then
+    VERDICT[$name]="BLOCKED"; REASON[$name]="$reasons"; continue
+  fi
+  if [ -z "$maint" ]; then
+    VERDICT[$name]="CAUTION"; REASON[$name]="orphaned (no maintainer)"; continue
+  fi
+  if in_set "$maint" "$FORGED"; then
+    reasons="${reasons:+$reasons; }note: '$maint' identity was forged in attack; verify upstream"
+  fi
+
+  # minor vs major
+  reqby="$(pacman -Qi "$name" 2>/dev/null | awk -F': ' '/^Required By/{print $2}')"
+  major=0
+  { [ -n "$reqby" ] && [ "$reqby" != "None" ]; } && major=1
+  ge_float "$pop" "$POP_THRESHOLD" && major=1
+  [ "${vot%.*}" -ge "$VOTES_THRESHOLD" ] 2>/dev/null && major=1
+
+  if [ "$major" = 1 ]; then
+    VERDICT[$name]="RECOMMENDED"; REASON[$name]="${reasons:+$reasons; }depended-on / popular"
+  else
+    VERDICT[$name]="OPTIONAL"; REASON[$name]="${reasons:+$reasons; }minor leaf package"
+  fi
+done
+
+cp "$NEW_SNAP" "$SNAPSHOT"
+
+# --- sort + display ----------------------------------------------------------
+order() { case "$1" in BLOCKED) echo 0;; CAUTION) echo 1;; OPTIONAL) echo 2;;
+  RECOMMENDED) echo 3;; *) echo 4;; esac; }
+vcolor() { case "$1" in BLOCKED) printf '%s' "$RED";; CAUTION|OPTIONAL) printf '%s' "$YELLOW";;
+  RECOMMENDED) printf '%s' "$GREEN";; *) printf '%s' "$DIM";; esac; }
+
+SORTED=()
+while read -r _ name; do SORTED+=("$name"); done < <(
+  for name in "${NAMES[@]}"; do printf '%s %s\n' "$(order "${VERDICT[$name]}")" "$name"; done | sort -k1,1n -k2,2)
+
+printf '\n'
+hdr=$(printf '%-28s %-22s %-16s %-13s %-4s %-12s %s' PACKAGE VERSION MAINTAINER "LAST ACTIVITY" CHG POP/VOTES VERDICT)
+printf '%s%s%s\n' "$BOLD" "$hdr" "$RST"
+printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 ${#hdr}))" "$RST"
+for name in "${SORTED[@]}"; do
+  col="$(vcolor "${VERDICT[$name]}")"
+  ver="${OLD[$name]} -> ${NEW[$name]}"; [ "${#ver}" -gt 22 ] && ver="${ver:0:20}.."
+  pv="$(printf '%.2f/%s' "${POP[$name]:-0}" "${VOT[$name]:-0}")"
+  printf '%s%-28.28s %-22s %-16.16s %-13s %-4s %-12s %s%s\n' \
+    "$col" "$name" "$ver" "${MAINT[$name]}" "$(rel_time "${LMOD[$name]}")" \
+    "${CHANGED[$name]:-}" "$pv" "${VERDICT[$name]}" "$RST"
+done
+
+# reasons footnotes
+printf '\n'
+for name in "${SORTED[@]}"; do
+  v="${VERDICT[$name]}"
+  { [ "$v" = "RECOMMENDED" ] && [ -z "${CHANGED[$name]:-}" ]; } && continue
+  [ -z "${REASON[$name]:-}" ] && continue
+  printf '  %s%s%s: %s\n' "$(vcolor "$v")" "$name" "$RST" "${REASON[$name]}"
+done
+
+# --- audit csv ---------------------------------------------------------------
+AUDIT="$STATE_DIR/cleared-$(date +%F).csv"
+{ echo "name,old,new,maintainer,verdict,reasons"
+  for name in "${SORTED[@]}"; do
+    printf '%s,%s,%s,%s,%s,"%s"\n' "$name" "${OLD[$name]:-}" "${NEW[$name]:-}" \
+      "${MAINT[$name]}" "${VERDICT[$name]}" "${REASON[$name]//\"/\"\"}"
+  done; } > "$AUDIT"
+
+RECOMMENDED=(); BLOCKED=()
+for name in "${SORTED[@]}"; do
+  [ "${VERDICT[$name]}" = "RECOMMENDED" ] && RECOMMENDED+=("$name")
+  [ "${VERDICT[$name]}" = "BLOCKED" ] && BLOCKED+=("$name")
+done
+printf '\n%s%d recommended%s, %s%d blocked%s. Audit: %s%s%s\n' \
+  "$GREEN" "${#RECOMMENDED[@]}" "$RST" "$RED" "${#BLOCKED[@]}" "$RST" "$DIM" "$AUDIT" "$RST"
+
+# --- action ------------------------------------------------------------------
+do_update() {
+  if [ "$#" -eq 0 ]; then echo "Nothing to update."; return; fi
+  printf '%sRunning: %s -S --needed %s%s\n' "$BOLD" "$HELPER" "$*" "$RST"
+  "$HELPER" -S --needed "$@"
+}
+
+if [ "$YES" = 1 ]; then do_update "${RECOMMENDED[@]}"; exit 0; fi
+
+printf '\n'
+read -r -p "Update [a]ll / [r]ecommended / [q]uit? " choice
+case "${choice,,}" in
+  r) do_update "${RECOMMENDED[@]}" ;;
+  a)
+    if [ "${#BLOCKED[@]}" -gt 0 ]; then
+      read -r -p "${RED}This includes ${#BLOCKED[@]} BLOCKED package(s). Type 'yes' to proceed: ${RST}" w
+      [ "${w,,}" = "yes" ] || { echo "Aborted."; exit 0; }
+    fi
+    printf '%sRunning: %s -Sua%s\n' "$BOLD" "$HELPER" "$RST"
+    "$HELPER" -Sua ;;
+  *) echo "No changes made. Snapshot updated for next run." ;;
+esac
