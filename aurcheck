@@ -112,8 +112,28 @@ while read -r name oldv arrow newv _; do
   fi
 done < <("$HELPER" -Qua 2>/dev/null)
 
-if [ "${#NAMES[@]}" -eq 0 ]; then
-  echo "${GREEN}No AUR updates available. Nothing to do.${RST}"; exit 0
+# --- sync repo databases + enumerate official-repo updates -------------------
+# Arch's core/extra/multilib repos were unaffected by the AUR attack, so once
+# synced these are trusted outright — listed via $HELPER (never pacman
+# directly) to keep this an AUR-helper-only tool, with pacman only as a
+# fallback if the helper's own sync fails.
+echo "${DIM}Syncing repo databases via $HELPER…${RST}"
+if ! "$HELPER" -Sy >/dev/null 2>&1; then
+  echo "${YELLOW}warning: $HELPER -Sy failed, falling back to pacman -Sy${RST}" >&2
+  sudo pacman -Sy >/dev/null 2>&1 \
+    || echo "${YELLOW}warning: repo sync failed; repo update list may be stale or empty${RST}" >&2
+fi
+
+REPO_NAMES=()
+while read -r name oldv arrow newv _; do
+  [ -z "$name" ] && continue
+  if [ "$arrow" = "->" ]; then
+    OLD[$name]="$oldv"; NEW[$name]="$newv"; REPO_NAMES+=("$name")
+  fi
+done < <("$HELPER" -Qu 2>/dev/null)
+
+if [ "${#NAMES[@]}" -eq 0 ] && [ "${#REPO_NAMES[@]}" -eq 0 ]; then
+  echo "${GREEN}No updates available. Nothing to do.${RST}"; exit 0
 fi
 
 # --- query AUR RPC in chunks -------------------------------------------------
@@ -233,15 +253,24 @@ done
 
 cp "$NEW_SNAP" "$SNAPSHOT"
 
+# official-repo packages are trusted outright (Arch repos weren't part of the
+# AUR supply-chain attack) — skip classification entirely, never BLOCKED.
+declare -A KIND
+for name in "${REPO_NAMES[@]}"; do
+  VERDICT[$name]="RECOMMENDED"; REASON[$name]="official repo, trusted"
+  CHANGED[$name]=""; KIND[$name]="repo"
+done
+
 # --- sort + display ----------------------------------------------------------
 order() { case "$1" in BLOCKED) echo 0;; CAUTION) echo 1;; OPTIONAL) echo 2;;
   RECOMMENDED) echo 3;; *) echo 4;; esac; }
 vcolor() { case "$1" in BLOCKED) printf '%s' "$RED";; CAUTION|OPTIONAL) printf '%s' "$YELLOW";;
   RECOMMENDED) printf '%s' "$GREEN";; *) printf '%s' "$DIM";; esac; }
 
+ALL_NAMES=("${NAMES[@]}" "${REPO_NAMES[@]}")
 SORTED=()
 while read -r _ name; do SORTED+=("$name"); done < <(
-  for name in "${NAMES[@]}"; do printf '%s %s\n' "$(order "${VERDICT[$name]}")" "$name"; done | sort -k1,1n -k2,2)
+  for name in "${ALL_NAMES[@]}"; do printf '%s %s\n' "$(order "${VERDICT[$name]}")" "$name"; done | sort -k1,1n -k2,2)
 
 printf '\n'
 hdr=$(printf '%-28s %-22s %-16s %-13s %-4s %-12s %s' PACKAGE VERSION MAINTAINER "LAST ACTIVITY" CHG POP/VOTES VERDICT)
@@ -250,9 +279,14 @@ printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 ${#hdr}))" "$RST"
 for name in "${SORTED[@]}"; do
   col="$(vcolor "${VERDICT[$name]}")"
   ver="${OLD[$name]} -> ${NEW[$name]}"; [ "${#ver}" -gt 22 ] && ver="${ver:0:20}.."
-  pv="$(printf '%.2f/%s' "${POP[$name]:-0}" "${VOT[$name]:-0}")"
+  if [ "${KIND[$name]:-}" = "repo" ]; then
+    maint="official repo"; last="trusted"; pv="—"
+  else
+    maint="${MAINT[$name]}"; last="$(rel_time "${LMOD[$name]}")"
+    pv="$(printf '%.2f/%s' "${POP[$name]:-0}" "${VOT[$name]:-0}")"
+  fi
   printf '%s%-28.28s %-22s %-16.16s %-13s %-4s %-12s %s%s\n' \
-    "$col" "$name" "$ver" "${MAINT[$name]}" "$(rel_time "${LMOD[$name]}")" \
+    "$col" "$name" "$ver" "$maint" "$last" \
     "${CHANGED[$name]:-}" "$pv" "${VERDICT[$name]}" "$RST"
 done
 
@@ -299,7 +333,6 @@ case "${choice,,}" in
       read -r -p "${RED}This includes ${#BLOCKED[@]} BLOCKED package(s). Type 'yes' to proceed: ${RST}" w
       [ "${w,,}" = "yes" ] || { echo "Aborted."; exit 0; }
     fi
-    printf '%sRunning: %s -Sua%s\n' "$BOLD" "$HELPER" "$RST"
-    "$HELPER" -Sua ;;
+    do_update "${SORTED[@]}" ;;
   *) echo "No changes made. Snapshot updated for next run." ;;
 esac

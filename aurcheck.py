@@ -117,6 +117,32 @@ def explicit_packages():
     return set(run(["pacman", "-Qqe"])[1].split())
 
 
+def sync_repos(helper):
+    """Refresh repo sync dbs via the AUR helper (fall back to pacman -Sy)."""
+    rc = subprocess.run([helper, "-Sy"]).returncode
+    if rc != 0:
+        print(f"{C.YELLOW}warning: {helper} -Sy failed, falling back to "
+              f"pacman -Sy{C.RESET}", file=sys.stderr)
+        rc = subprocess.run(["sudo", "pacman", "-Sy"]).returncode
+    return rc == 0
+
+
+def get_repo_updatable(helper):
+    """Return dict name -> (old_ver, new_ver) for official-repo packages."""
+    rc, out = run([helper, "-Qu"])
+    updatable = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if "->" in parts:
+            i = parts.index("->")
+            if i >= 2:
+                updatable[parts[0]] = (parts[i - 1], parts[i + 1])
+    return updatable
+
+
 def required_by(name):
     """Return list of packages requiring `name` (empty == leaf)."""
     rc, out = run(["pacman", "-Qi", name])
@@ -356,11 +382,15 @@ def print_table(rows, updatable):
         ver = f"{old} -> {new}"
         if len(ver) > 22:
             ver = ver[:20] + ".."
-        maint = (r["maintainer"] or "—")[:15]
-        pv = f"{r['popularity'] or 0:.2f}/{r['votes'] or 0}"
         chg = "YES" if r["changed"] else ""
+        if r["kind"] == "repo":
+            maint, last, pv = "official repo", "trusted", "—"
+        else:
+            maint = (r["maintainer"] or "—")[:15]
+            last = rel_time(r["lastmod"])
+            pv = f"{r['popularity'] or 0:.2f}/{r['votes'] or 0}"
         print(f"{col}{r['name']:<28.28} {ver:<22} {maint:<16} "
-              f"{rel_time(r['lastmod']):<13} {chg:<4} {pv:<12} "
+              f"{last:<13} {chg:<4} {pv:<12} "
               f"{r['verdict']}{C.RESET}")
     # reasons footnotes for anything not a plain recommend
     notable = [r for r in rows if r["verdict"] != "RECOMMENDED" or r["reasons"]]
@@ -427,8 +457,15 @@ def main():
 
     print(C.DIM + f"Enumerating AUR updates via {helper}…" + C.RESET)
     updatable = get_updatable(helper)
-    if not updatable:
-        print(C.GREEN + "No AUR updates available. Nothing to do." + C.RESET)
+
+    print(C.DIM + f"Syncing repo databases via {helper}…" + C.RESET)
+    if not sync_repos(helper):
+        print(C.YELLOW + "warning: repo sync failed; repo update list may "
+              "be stale or empty" + C.RESET, file=sys.stderr)
+    repo_updatable = get_repo_updatable(helper)
+
+    if not updatable and not repo_updatable:
+        print(C.GREEN + "No updates available. Nothing to do." + C.RESET)
         return
 
     print(C.DIM + f"Querying AUR metadata for {len(updatable)} package(s)…"
@@ -451,13 +488,20 @@ def main():
             }
     save_snapshot(new_snap)
 
+    # official-repo packages are trusted outright (Arch repos weren't part
+    # of the AUR supply-chain attack) — skip classify(), never BLOCKED.
+    for name, (old, new) in repo_updatable.items():
+        rows.append(_result(name, None, "repo", "RECOMMENDED",
+                            ["official repo, trusted"], False))
+
+    all_updatable = {**updatable, **repo_updatable}
     rows.sort(key=lambda r: (SORT_ORDER.get(r["verdict"], 9), r["name"]))
     print()
-    print_table(rows, updatable)
+    print_table(rows, all_updatable)
 
     recommended = [r["name"] for r in rows if r["verdict"] == "RECOMMENDED"]
     blocked = [r for r in rows if r["verdict"] == "BLOCKED"]
-    audit = write_audit(rows, updatable)
+    audit = write_audit(rows, all_updatable)
     print()
     print(f"{C.GREEN}{len(recommended)} recommended{C.RESET}, "
           f"{C.RED}{len(blocked)} blocked{C.RESET}. Audit: {C.DIM}{audit}{C.RESET}")
@@ -477,8 +521,7 @@ def main():
             if warn.strip().lower() != "yes":
                 print("Aborted.")
                 return
-        print(C.BOLD + f"Running: {helper} -Sua" + C.RESET)
-        subprocess.run([helper, "-Sua"])
+        do_update(helper, list(all_updatable.keys()))
     else:
         print("No changes made. Snapshot updated for next run.")
 
